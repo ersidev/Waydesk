@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Waydesk
+Comment=Toggle virtual display for Android tablet streaming
+Exec=waydesk toggle
+Icon=video-display
+Terminal=false
+Type=Application
+Categories=Utility;System;

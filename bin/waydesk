@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+
+# Waydesk - Multi-Compositor Tablet Second Monitor Manager
+# Supports KDE Plasma (Wayland), Hyprland, and Sway.
+
+# Argument and resolution parsing
+if [[ "$1" =~ ^[0-9]+x[0-9]+$ ]]; then
+    ACTION="start"
+    RES="$1"
+else
+    ACTION="${1:-toggle}"
+    RES="${2:-2000x1200}"
+fi
+
+# Detect sunshine systemd unit name across distros
+SUNSHINE_SERVICE="app-dev.lizardbyte.app.Sunshine.service"
+if ! systemctl --user list-unit-files "$SUNSHINE_SERVICE" &>/dev/null; then
+    SUNSHINE_SERVICE="sunshine.service"
+fi
+SUNSHINE_CONF="$HOME/.config/sunshine/sunshine.conf"
+
+detect_compositor() {
+    if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || pgrep -x Hyprland >/dev/null 2>&1; then
+        echo "hyprland"
+    elif [ -n "$SWAYSOCK" ] || pgrep -x sway >/dev/null 2>&1; then
+        echo "sway"
+    elif [[ "$XDG_CURRENT_DESKTOP" =~ [Kk][Dd][Ee] ]] || pgrep -x kwin_wayland >/dev/null 2>&1; then
+        echo "kde"
+    else
+        echo "unknown"
+    fi
+}
+
+COMPOSITOR="$(detect_compositor)"
+
+notify() {
+    local urgency="${1:-normal}"
+    local title="$2"
+    local msg="$3"
+    notify-send -u "$urgency" -i video-display "$title" "$msg" 2>/dev/null || true
+}
+
+configure_sunshine() {
+    local capture="$1"
+    local output="$2"
+    mkdir -p "$(dirname "$SUNSHINE_CONF")"
+    
+    local changed=0
+    if [ ! -f "$SUNSHINE_CONF" ]; then
+        printf "capture = %s\noutput_name = %s\n" "$capture" "$output" > "$SUNSHINE_CONF"
+        changed=1
+    else
+        grep -q "^capture *= *$capture" "$SUNSHINE_CONF" 2>/dev/null || changed=1
+        grep -q "^output_name *= *$output" "$SUNSHINE_CONF" 2>/dev/null || changed=1
+        if [ "$changed" -eq 1 ]; then
+            sed -i '/^capture *=/d' "$SUNSHINE_CONF"
+            sed -i '/^output_name *=/d' "$SUNSHINE_CONF"
+            echo "capture = $capture" >> "$SUNSHINE_CONF"
+            echo "output_name = $output" >> "$SUNSHINE_CONF"
+        fi
+    fi
+
+    # Start or restart Sunshine if config changed
+    if systemctl --user is-active --quiet "$SUNSHINE_SERVICE"; then
+        if [ "$changed" -eq 1 ]; then
+            systemctl --user restart "$SUNSHINE_SERVICE"
+        fi
+    else
+        systemctl --user start "$SUNSHINE_SERVICE"
+    fi
+}
+
+is_running() {
+    case "$COMPOSITOR" in
+        hyprland)
+            hyprctl monitors 2>/dev/null | grep -q "Waydesk"
+            ;;
+        sway)
+            swaymsg -t get_outputs 2>/dev/null | grep -q '"name": *"HEADLESS-'
+            ;;
+        kde|*)
+            pgrep -f "krfb-virtualmonitor.*Waydesk" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+start_monitor() {
+    case "$COMPOSITOR" in
+        hyprland)
+            if ! command -v hyprctl &>/dev/null || ! command -v sunshine &>/dev/null; then
+                notify "critical" "Waydesk" "Missing dependencies: hyprctl or sunshine"
+                exit 1
+            fi
+            configure_sunshine "wlroots" "Waydesk"
+            hyprctl output create headless Waydesk >/dev/null 2>&1
+            hyprctl keyword monitor "Waydesk, ${RES}@60, auto, 1" >/dev/null 2>&1
+            ;;
+        sway)
+            if ! command -v swaymsg &>/dev/null || ! command -v sunshine &>/dev/null; then
+                notify "critical" "Waydesk" "Missing dependencies: swaymsg or sunshine"
+                exit 1
+            fi
+            swaymsg create_output >/dev/null 2>&1
+            sleep 0.2
+            local out
+            out=$(swaymsg -t get_outputs 2>/dev/null | grep -o '"name": *"HEADLESS-[0-9]*"' | head -n1 | cut -d'"' -f4)
+            [ -z "$out" ] && out="HEADLESS-1"
+            swaymsg output "$out" resolution "$RES" position auto >/dev/null 2>&1
+            configure_sunshine "wlroots" "$out"
+            ;;
+        kde)
+            if ! command -v krfb-virtualmonitor &>/dev/null || ! command -v sunshine &>/dev/null; then
+                notify "critical" "Waydesk" "Missing dependencies: krfb or sunshine"
+                exit 1
+            fi
+            configure_sunshine "kwin" "Virtual-Waydesk"
+            nohup krfb-virtualmonitor --name "Waydesk" --resolution "$RES" --port 5900 --password secret >/dev/null 2>&1 &
+            ;;
+        *)
+            notify "critical" "Waydesk" "Unsupported compositor: $XDG_CURRENT_DESKTOP"
+            echo "Unsupported or undetected compositor: $COMPOSITOR" >&2
+            exit 1
+            ;;
+    esac
+
+    local cname="${COMPOSITOR^}"
+    notify "normal" "Waydesk" "Virtual monitor enabled (${RES} on ${cname}). Ready for Moonlight."
+}
+
+stop_monitor() {
+    case "$COMPOSITOR" in
+        hyprland)
+            hyprctl output remove Waydesk >/dev/null 2>&1
+            ;;
+        sway)
+            for out in $(swaymsg -t get_outputs 2>/dev/null | grep -o '"name": *"HEADLESS-[0-9]*"' | cut -d'"' -f4); do
+                swaymsg output "$out" unplug >/dev/null 2>&1 || swaymsg output "$out" disable >/dev/null 2>&1
+            done
+            ;;
+        kde|*)
+            pkill -f "krfb-virtualmonitor.*Waydesk"
+            ;;
+    esac
+
+    systemctl --user stop "$SUNSHINE_SERVICE" 2>/dev/null
+    notify "normal" "Waydesk" "Virtual monitor and Sunshine stopped."
+}
+
+case "$ACTION" in
+    on|start)
+        if is_running; then
+            notify "normal" "Waydesk" "Virtual monitor is already running."
+        else
+            start_monitor
+        fi
+        ;;
+    off|stop)
+        if is_running; then
+            stop_monitor
+        else
+            notify "normal" "Waydesk" "Virtual monitor is not running."
+        fi
+        ;;
+    status)
+        cname="${COMPOSITOR^}"
+        if is_running; then
+            echo "Running (${cname})"
+        else
+            echo "Stopped (${cname})"
+        fi
+        ;;
+    compositor)
+        echo "$COMPOSITOR"
+        ;;
+    toggle|*)
+        if is_running; then
+            stop_monitor
+        else
+            start_monitor
+        fi
+        ;;
+esac
